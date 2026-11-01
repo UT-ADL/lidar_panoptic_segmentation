@@ -175,6 +175,19 @@ ground within 2.7-75 m.
 - Learned velocity, mean error of matched objects (moving / static, m/s): PandaSet 0.85 / 0.24, Waymo 0.76 / 0.19,
   nuScenes 0.85 / 0.23.
 
+**Evaluation-only datasets** (box-labelled, not trained on; unknown embedding, nuScenes head, 300 evenly spaced
+validation frames, PyTorch fp32):
+
+| Dataset | Validation frames (used / split) | Previous scans | pseg_v6.1: PQ / recall of box points | pseg_v2: PQ / recall of box points |
+|---|---|---|---|---|
+| Argoverse 2 | 300 / 4806 | 4 (0.1-0.4 s) | 0.838 / 0.998 | 0.818 / 0.998 |
+| ONCE | 300 / 3321 | none (the only cached one is 0.5 s old, outside the trained range) | 0.833 / 0.998 | 0.848 / 0.999 |
+| Lyft Level 5 | 300 / 1260 | 2 (0.2 and 0.4 s) | 0.893 / 0.993 | 0.898 / 0.994 |
+
+These sets have only 3D boxes: an object instance is the set of points inside a labelled box, and the rest of the scan
+has no ground or static labels. PQ therefore depends on how tightly the boxes fit and which classes were labelled, and
+obstacle recall is given for the box points only (the unlabelled rest includes the road).
+
 **Our test set.** 300 labelled VLP-32C scans from Tartu on the lab's car, never trained on (box-labelled vehicles and
 pedestrians within 50 m), through the deployed node code with TensorRT fp16:
 
