@@ -1,0 +1,6 @@
+results.npz
+__pycache__/
+.venv/
+venv/
+*.engine
+*.profile
