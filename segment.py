@@ -2,13 +2,13 @@
 """Lidar panoptic segmentation of one scan with the ONNX model: per point ground / static / dynamic, object instances,
 classes and the over-ground velocity of dynamic objects (from the 4 previous scans).
 
-usage: python segment.py example.pcd [--dataset unknown] [--lidar_height 2.11] [--no-sweeps] [--show] [--plot out.png]
-                         [--out results.npz] [--cpu] [--trt] [--repeat N]
+usage: python segment.py example.pcd [--model pseg_v6.2_fp16.onnx] [--dataset unknown] [--lidar_height 2.11]
+                         [--no-sweeps] [--show] [--plot out.png] [--out results.npz] [--cpu] [--trt] [--repeat N]
 
 The scan is a PCD file with the fields x y z intensity in the lidar frame (x forward, y left, z up, origin at the
 lidar) and the sensor's raw intensity. Previous scans are read from <scan>_sweep_1.pcd .. _sweep_4.pcd (1 = newest),
 already transformed into the current lidar frame, with a time lag of k x SWEEP_PERIOD (0.1 s at 10 Hz). --dataset selects the style embedding, class head and intensity mapping (unknown: the generic style, nuScenes
-classes, VLP-32C intensity). --show opens an interactive Open3D view, --plot renders the same scene offscreen to a PNG
+classes, VLP-32C intensity). --model: the fp16 file (default) or the fp32 one, pseg_v6.2.onnx. --show opens an interactive Open3D view, --plot renders the same scene offscreen to a PNG
 (both need `pip install open3d`; the printed object list is the legend). --cpu: CPU even if CUDA is available.
 --trt: TensorRT fp16 through onnxruntime's TensorRT provider (needs onnxruntime-gpu with TensorRT), inputs padded to
 a fixed size so that one engine is built. --repeat N: N more runs of the model on the same inputs and the median time per scan (session.run only, without
@@ -19,7 +19,7 @@ import numpy as np
 import onnxruntime as ort
 from pypcd4 import PointCloud
 
-MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pseg_v6.2_fp16.onnx')
+MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pseg_v6.2_fp16.onnx')   # fp32: pseg_v6.2.onnx
 FIXED_POINTS = 65536     # --trt: padded size of the points input (a VLP-32C scan has at most ~57600 points)
 MIN_RANGE = 2.7          # m, minimum range of our lidar driver (closer points: the car body)
 MAX_HEIGHT = 2.5         # m above the local ground: higher non-ground points (canopy) are not obstacles
@@ -63,7 +63,7 @@ def read_sweeps(scan_path, n_sweeps):
     return np.concatenate(rows) if rows else np.zeros((0, 5), np.float32)
 
 
-def session(cpu, trt):
+def session(model, cpu, trt):
     options = ort.SessionOptions()
     if hasattr(os, 'sched_getaffinity'):   # the CPUs this process may use (containers, batch systems)
         options.intra_op_num_threads = len(os.sched_getaffinity(0))
@@ -72,7 +72,7 @@ def session(cpu, trt):
     if trt:   # TensorRT fp16, the engine cached in the working directory (the first run builds it: minutes)
         providers = [('TensorrtExecutionProvider', dict(trt_fp16_enable=True, trt_engine_cache_enable=True,
                                                         trt_engine_cache_path='.'))] + providers
-    return ort.InferenceSession(MODEL, options, providers=providers)
+    return ort.InferenceSession(model, options, providers=providers)
 
 
 def model_inputs(a, shapes, n_sweeps, dataset, fixed):
@@ -173,6 +173,7 @@ def plot(points, group, inst, objects, lidar_height, path):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('scan')
+    ap.add_argument('--model', default=MODEL, help='ONNX file: pseg_v6.2_fp16.onnx (default) or pseg_v6.2.onnx (fp32)')
     ap.add_argument('--dataset', default='unknown', help='style, class head and intensity mapping (see the metadata)')
     ap.add_argument('--lidar_height', type=float, default=2.11, help='lidar height above the ground (m)')
     ap.add_argument('--no-sweeps', action='store_true', help='without previous scans (no usable velocity)')
@@ -185,7 +186,7 @@ def main():
                     'padded inputs')
     a = ap.parse_args()
 
-    sess = session(a.cpu, a.trt)
+    sess = session(a.model, a.cpu, a.trt)
     meta = sess.get_modelmeta().custom_metadata_map
     shapes = {i.name: i.shape for i in sess.get_inputs()}
     datasets = json.loads(meta['datasets'])
@@ -203,7 +204,7 @@ def main():
     n = min(len(scan), len(inputs['points']))
     points, group, inst, native = scan[:n], outputs['group'][:n], outputs['inst'][:n], outputs['native'][:n]
     velocity = outputs['velocity'][:n]
-    print(f'{os.path.basename(MODEL)} on {sess.get_providers()[0]}, dataset {a.dataset}: {n} points, '
+    print(f'{os.path.basename(a.model)} on {sess.get_providers()[0]}, dataset {a.dataset}: {n} points, '
           f'{0 if a.no_sweeps else json.loads(meta["sweeps"])} previous scans')
     print('  ' + ', '.join(f'{name} {np.sum(group == g)}' for g, name in enumerate(GROUPS)) +
           f', none {np.sum(group < 0)} (outside the grid, above max_height or isolated)')

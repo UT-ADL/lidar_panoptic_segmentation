@@ -4,8 +4,8 @@
 
 A neural network that labels every point of a rotating lidar's scan in one pass: ground, static obstacle or dynamic
 obstacle; object instances of the dynamic points; a semantic class from one of four dataset label sets; and, from the 4
-previous scans, the over-ground velocity of every dynamic object. This repository holds the model as one ONNX file, an
-example scan from our car and one script to run both.
+previous scans, the over-ground velocity of every dynamic object. This repository holds the model as an ONNX file (fp16, and
+the fp32 original), an example scan from our car and one script to run them.
 
 [Demo video: the model on our car in Tartu](https://youtu.be/r0lbQwu6Mmk?si=keMga1_NuFt5JODf)
 
@@ -42,6 +42,7 @@ pseg_v6.2_fp16.onnx on CPUExecutionProvider, dataset unknown: 47827 points, 4 pr
 0.1, 0.2, 0.3 and 0.4 s (`SWEEP_PERIOD` in the script, a 10 Hz lidar), and uses the CUDA provider of onnxruntime if it is available, else the CPU.
 Options:
 
+- `--model pseg_v6.2_fp16.onnx`: the ONNX file, the fp16 one (default) or the fp32 one `pseg_v6.2.onnx`;
 - `--dataset unknown`: the style, class head and intensity mapping, one of `nuscenes`, `semantickitti`, `waymo`,
   `pandaset`, `unknown` (see [Styles and datasets](#styles-and-datasets));
 - `--lidar_height 2.11`: the lidar's height above the ground (m);
@@ -72,14 +73,15 @@ Options:
   (fragments of long vehicles).
 - **Output per point:** group (ground / static / dynamic / none), instance id of dynamic points (per scan, not
   tracked), class, xy velocity of its object.
-- **fp16:** `pseg_v6.2_fp16.onnx` (16 MB) has the network in fp16: every node of the network module (point MLP,
+- **fp16 and fp32:** `pseg_v6.2.onnx` (30 MB) is the exported fp32 graph. `pseg_v6.2_fp16.onnx` (16 MB) has the
+  network in fp16: every node of the network module (point MLP,
   max-pooling scatter into the BEV grid, style embedding and modulation, backbone, FPN necks and heads), converted by
   onnxruntime's float16 converter with fp32 inputs and outputs (`keep_io_types`). The graph's own pre- and
   post-processing (intensity mapping, heatmap peaks, instance assignment, local ground height, filters, the fragment and
   velocity rules) stays fp32. Against the fp32 graph on the full validation splits, PQ drops by 0.019 on nuScenes and
   by 0.002-0.005 on SemanticKITTI, Waymo and PandaSet, and the official metrics by up to 0.025 (see
-  [Results](#results)). TensorRT's own fp16 mode applied to the fp32 graph lost less on our data (-0.0025 PQ); this
-  repository ships only the fp16 file.
+  [Results](#results)). TensorRT's own fp16 mode applied to the fp32 graph lost less on our data (-0.0025 PQ), so with
+  TensorRT the fp32 file may be the better input (`--model pseg_v6.2.onnx --trt`; not measured for this file).
 - **Input size:** `points` and `sweeps` accept any number of rows. A whole 64-beam scan can be passed. Padding rows
   `(1e4, 0, 0, 0[, 0])` are ignored, and fixed-size padded inputs (65536 / 262144 rows) give TensorRT a single input
   shape (`segment.py --trt`).
@@ -177,8 +179,8 @@ mounted 2.11 m above the ground on the car's roof).
 ## Results
 
 All numbers are on the full validation splits, with each segmentation set's own style and class head through the
-`dataset` input and the box-labelled sets with `unknown`. The first value is the shipped file `pseg_v6.2_fp16.onnx`;
-the value in brackets is the same graph in fp32. All runs use onnxruntime 1.20 (CUDA provider) on whole scans.
+`dataset` input and the box-labelled sets with `unknown`. The first value is `pseg_v6.2_fp16.onnx`; the value in
+brackets is the fp32 file `pseg_v6.2.onnx`. All runs use onnxruntime 1.20 (CUDA provider) on whole scans.
 
 **Official metrics** of the four segmentation datasets:
 
@@ -241,14 +243,14 @@ model or creating the session), on the example scan (47827 points) with its 4 pr
 | AMD EPYC 7763, 16 threads | onnxruntime 1.19 CPU provider | 2.8 s (2.3 s without previous scans) |
 
 Pre-processing (reading the five PCD files, the range filter, padding) adds 10-14 ms. The fp16 GPU runs give
-slightly different results from the CPU run (37-39 objects against 38 on the example scan); the Quick start output is
-the CPU one. The script prints the provider it runs on: an onnxruntime-gpu build for another CUDA or cuDNN version
+slightly different results from the CPU run (37-39 objects against 38 on the example scan; the fp32 file gives 35 on
+the CPU, with 162 dynamic points without an instance); the Quick start output is the fp16 CPU one. The script prints the provider it runs on: an onnxruntime-gpu build for another CUDA or cuDNN version
 than the machine's fails to load its CUDA provider and falls back to the CPU.
 
 ## License
 
 - **Code** (`segment.py`): MIT, see [LICENSE](LICENSE).
-- **Model weights** (`pseg_v6.2_fp16.onnx`): licensed under
+- **Model weights** (`pseg_v6.2.onnx`, `pseg_v6.2_fp16.onnx`): licensed under
   [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/), copyright 2026 University of Tartu,
   Autonomous Driving Lab, together with the Waymo Dataset License Agreement for Non-Commercial Use below. The weights
   were derived by training on nuScenes, SemanticKITTI, the Waymo Open Dataset and PandaSet (see
