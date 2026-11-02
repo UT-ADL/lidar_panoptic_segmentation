@@ -38,8 +38,8 @@ pseg_v6.2_fp16.onnx on CPUExecutionProvider, dataset unknown: 47827 points, 4 pr
     ...
 ```
 
-`segment.py` reads the previous scans `example_sweep_1.pcd` .. `example_sweep_4.pcd` (1 = newest) and their time lags
-from `sweeps.json` next to the scan, and uses the CUDA provider of onnxruntime if it is available, else the CPU.
+`segment.py` reads the previous scans `example_sweep_1.pcd` .. `example_sweep_4.pcd` (1 = newest) with time lags of
+0.1, 0.2, 0.3 and 0.4 s (`SWEEP_PERIOD` in the script, a 10 Hz lidar), and uses the CUDA provider of onnxruntime if it is available, else the CPU.
 Options:
 
 - `--dataset unknown`: the style, class head and intensity mapping, one of `nuscenes`, `semantickitti`, `waymo`,
@@ -170,8 +170,8 @@ start), fill the input with padding: segmentation stays almost the same, but the
 
 In this repository `example_sweep_1.pcd` .. `example_sweep_4.pcd` are the 4 scans before `example.pcd`, moved into its
 lidar frame with the car's recorded GNSS/INS localization, with the 2.7 m minimum range applied in their own frame.
-`sweeps.json` (`{"lag": [0.1, 0.2, 0.3, 0.4]}`) gives their lags, rounded from the recorded 0.0995, 0.1997, 0.2999 and
-0.3995 s. All are binary PCD with float32 x y z intensity, the intensity raw as from the Velodyne VLP-32C (10 Hz,
+Their lags are 0.1, 0.2, 0.3 and 0.4 s (`SWEEP_PERIOD` x k in `segment.py`, rounded from the recorded 0.0995, 0.1997,
+0.2999 and 0.3995 s). All are binary PCD with float32 x y z intensity, the intensity raw as from the Velodyne VLP-32C (10 Hz,
 mounted 2.11 m above the ground on the car's roof).
 
 ## Results
@@ -277,7 +277,7 @@ than the machine's fails to load its CUDA provider and falls back to the CPU.
     ITSC 2021.
 
   No dataset provider endorses this model or its use.
-- **Example scans** (`example.pcd`, `example_sweep_*.pcd`, `sweeps.json`, `example.png`): the lab's own data,
+- **Example scans** (`example.pcd`, `example_sweep_*.pcd`, `example.png`): the lab's own data,
   licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/), credit: University of Tartu, Autonomous
   Driving Lab.
 

@@ -7,8 +7,7 @@ usage: python segment.py example.pcd [--dataset unknown] [--lidar_height 2.11] [
 
 The scan is a PCD file with the fields x y z intensity in the lidar frame (x forward, y left, z up, origin at the
 lidar) and the sensor's raw intensity. Previous scans are read from <scan>_sweep_1.pcd .. _sweep_4.pcd (1 = newest),
-already transformed into the current lidar frame, with their time lags (s) in sweeps.json {"lag": [...]} next to the
-scan. --dataset selects the style embedding, class head and intensity mapping (unknown: the generic style, nuScenes
+already transformed into the current lidar frame, with a time lag of k x SWEEP_PERIOD (0.1 s at 10 Hz). --dataset selects the style embedding, class head and intensity mapping (unknown: the generic style, nuScenes
 classes, VLP-32C intensity). --show opens an interactive Open3D view, --plot renders the same scene offscreen to a PNG
 (both need `pip install open3d`; the printed object list is the legend). --cpu: CPU even if CUDA is available.
 --trt: TensorRT fp16 through onnxruntime's TensorRT provider (needs onnxruntime-gpu with TensorRT), inputs padded to
@@ -51,14 +50,16 @@ def padded(rows, size, width):
     return out
 
 
+SWEEP_PERIOD = 0.1  # s between the scans of a 10 Hz lidar: the lag of the k-th previous scan is k x SWEEP_PERIOD
+
+
 def read_sweeps(scan_path, n_sweeps):
     """Previous scans next to the scan, with their time lag as a fifth column (newest first)."""
     base = os.path.splitext(scan_path)[0]
-    lags = json.load(open(os.path.join(os.path.dirname(os.path.abspath(scan_path)), 'sweeps.json')))['lag']
     rows = []
-    for k, lag in enumerate(lags[:n_sweeps], 1):
+    for k in range(1, n_sweeps + 1):
         s = read_pcd(f'{base}_sweep_{k}.pcd')
-        rows.append(np.column_stack((s, np.full(len(s), lag, np.float32))))
+        rows.append(np.column_stack((s, np.full(len(s), k * SWEEP_PERIOD, np.float32))))
     return np.concatenate(rows) if rows else np.zeros((0, 5), np.float32)
 
 
