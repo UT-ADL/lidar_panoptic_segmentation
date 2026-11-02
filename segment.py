@@ -39,6 +39,9 @@ def read_pcd(path):
 
 
 def padded(rows, size, width):
+    """rows as they are for a dynamic input (size not an int), else padded to the fixed size."""
+    if not isinstance(size, int):
+        return rows if len(rows) else np.array([PADDING[:width]], np.float32)
     out = np.tile(np.array(PADDING[:width], np.float32), (size, 1))
     if len(rows) > size:
         print(f'warning: {len(rows)} points, the model input holds {size}; the rest are left out')
@@ -185,7 +188,7 @@ def main():
     output_names = [o.name for o in sess.get_outputs()]
     outputs = dict(zip(output_names, sess.run(None, inputs)))
 
-    n = min(len(scan), shapes['points'][0])
+    n = len(scan) if not isinstance(shapes['points'][0], int) else min(len(scan), shapes['points'][0])
     points, group, inst, native = scan[:n], outputs['group'][:n], outputs['inst'][:n], outputs['native'][:n]
     velocity = outputs['velocity'][:n]
     print(f'{os.path.basename(MODEL)} on {sess.get_providers()[0]}, dataset {a.dataset}: {n} points, '
