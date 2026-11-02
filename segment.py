@@ -3,7 +3,7 @@
 classes and the over-ground velocity of dynamic objects (from the 4 previous scans).
 
 usage: python segment.py example.pcd [--dataset unknown] [--lidar_height 2.11] [--no-sweeps] [--show] [--plot out.png]
-                         [--out results.npz] [--cpu] [--repeat N]
+                         [--out results.npz] [--cpu] [--trt] [--repeat N]
 
 The scan is a PCD file with the fields x y z intensity in the lidar frame (x forward, y left, z up, origin at the
 lidar) and the sensor's raw intensity. Previous scans are read from <scan>_sweep_1.pcd .. _sweep_4.pcd (1 = newest),
@@ -11,7 +11,8 @@ already transformed into the current lidar frame, with their time lags (s) in sw
 scan. --dataset selects the style embedding, class head and intensity mapping (unknown: the generic style, nuScenes
 classes, VLP-32C intensity). --show opens an interactive Open3D view, --plot renders the same scene offscreen to a PNG
 (both need `pip install open3d`; the printed object list is the legend). --cpu: CPU even if CUDA is available.
---repeat N: N more runs of the model on the same inputs and the median time per scan (session.run only, without
+--trt: TensorRT fp16 through onnxruntime's TensorRT provider (needs onnxruntime-gpu with TensorRT), inputs padded to
+a fixed size so that one engine is built. --repeat N: N more runs of the model on the same inputs and the median time per scan (session.run only, without
 loading the model or creating the session), with the pre-processing time (reading, filtering, padding) separately.
 """
 import argparse, json, os, time
@@ -20,7 +21,8 @@ import onnxruntime as ort
 from pypcd4 import PointCloud
 
 MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pseg_v6.2_fp16.onnx')
-MIN_RANGE = 2.7          # m, minimum range of the lidar driver the model was deployed with
+FIXED_POINTS = 65536     # --trt: padded size of the points input (a VLP-32C scan has at most ~57600 points)
+MIN_RANGE = 2.7          # m, minimum range of our lidar driver (closer points: the car body)
 MAX_HEIGHT = 2.5         # m above the local ground: higher non-ground points (canopy) are not obstacles
 FILTER_RANGE = 38.0      # m, isolated static points (noise) are dropped within this range
 PADDING = [1e4, 0.0, 0.0, 0.0, 0.0]   # padding row of the fixed-size inputs: a point far outside the model's grid
@@ -60,17 +62,23 @@ def read_sweeps(scan_path, n_sweeps):
     return np.concatenate(rows) if rows else np.zeros((0, 5), np.float32)
 
 
-def session(cpu):
+def session(cpu, trt):
     options = ort.SessionOptions()
     if hasattr(os, 'sched_getaffinity'):   # the CPUs this process may use (containers, batch systems)
         options.intra_op_num_threads = len(os.sched_getaffinity(0))
     providers = ['CPUExecutionProvider'] if cpu else \
         [p for p in ('CUDAExecutionProvider', 'CPUExecutionProvider') if p in ort.get_available_providers()]
+    if trt:   # TensorRT fp16, the engine cached in the working directory (the first run builds it: minutes)
+        providers = [('TensorrtExecutionProvider', dict(trt_fp16_enable=True, trt_engine_cache_enable=True,
+                                                        trt_engine_cache_path='.'))] + providers
     return ort.InferenceSession(MODEL, options, providers=providers)
 
 
-def model_inputs(a, shapes, n_sweeps, dataset):
-    """The scan (minimum range applied) and the model's input arrays."""
+def model_inputs(a, shapes, n_sweeps, dataset, fixed):
+    """The scan (minimum range applied) and the model's input arrays; fixed: padded to (points, sweep rows) for a
+    dynamic input too (TensorRT builds one engine per input shape)."""
+    if fixed:
+        shapes = dict(shapes, points=[fixed[0], 4], sweeps=[fixed[1], 5])
     scan = read_pcd(a.scan)
     scan = scan[np.isfinite(scan).all(1) & (np.hypot(scan[:, 0], scan[:, 1]) >= MIN_RANGE)]
     inputs = dict(points=padded(scan, shapes['points'][0], 4), max_height=np.array([MAX_HEIGHT], np.float32),
@@ -172,9 +180,11 @@ def main():
     ap.add_argument('--out', default=None, help='save the per-point results (npz)')
     ap.add_argument('--cpu', action='store_true', help='CPU even if CUDA is available')
     ap.add_argument('--repeat', type=int, default=0, help='time N more runs of the model (session.run only)')
+    ap.add_argument('--trt', action='store_true', help='TensorRT fp16 (onnxruntime TensorRT provider), fixed-size '
+                    'padded inputs')
     a = ap.parse_args()
 
-    sess = session(a.cpu)
+    sess = session(a.cpu, a.trt)
     meta = sess.get_modelmeta().custom_metadata_map
     shapes = {i.name: i.shape for i in sess.get_inputs()}
     datasets = json.loads(meta['datasets'])
@@ -183,12 +193,13 @@ def main():
     class_names = json.loads(meta['class_names'])
     names = class_names[a.dataset if a.dataset in class_names else 'nuscenes']
     t = time.perf_counter()
-    scan, inputs = model_inputs(a, shapes, json.loads(meta['sweeps']), datasets.index(a.dataset))
+    fixed = (FIXED_POINTS, json.loads(meta['sweep_points'])) if a.trt else None
+    scan, inputs = model_inputs(a, shapes, json.loads(meta['sweeps']), datasets.index(a.dataset), fixed)
     t_pre = time.perf_counter() - t
     output_names = [o.name for o in sess.get_outputs()]
     outputs = dict(zip(output_names, sess.run(None, inputs)))
 
-    n = len(scan) if not isinstance(shapes['points'][0], int) else min(len(scan), shapes['points'][0])
+    n = min(len(scan), len(inputs['points']))
     points, group, inst, native = scan[:n], outputs['group'][:n], outputs['inst'][:n], outputs['native'][:n]
     velocity = outputs['velocity'][:n]
     print(f'{os.path.basename(MODEL)} on {sess.get_providers()[0]}, dataset {a.dataset}: {n} points, '

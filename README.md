@@ -3,10 +3,9 @@
 ## Demo
 
 A neural network that labels every point of a rotating lidar's scan in one pass: ground, static obstacle or dynamic
-obstacle; object instances of the dynamic points; one of the 30 nuScenes classes; and, from the 4 previous scans, the
-over-ground velocity of every dynamic object. In the lab's autonomy stack it replaces ground removal and clustering:
-static points go to the collision checker as points, dynamic objects with their classes and velocities go to the
-tracker. This repository holds the model as one ONNX file, an example scan from our car and one script to run both.
+obstacle; object instances of the dynamic points; a semantic class from one of four dataset label sets; and, from the 4
+previous scans, the over-ground velocity of every dynamic object. This repository holds the model as one ONNX file, an
+example scan from our car and one script to run both.
 
 [Demo video: the model on our car in Tartu](https://youtu.be/r0lbQwu6Mmk?si=keMga1_NuFt5JODf)
 
@@ -26,10 +25,10 @@ python segment.py example.pcd
 prints (CPU; the object list abbreviated):
 
 ```
-pseg_v6.1_fp16.onnx on CPUExecutionProvider: 47827 points, 4 previous scans
+pseg_v6.2_fp16.onnx on CPUExecutionProvider, dataset unknown: 47827 points, 4 previous scans
   ground 19632, static 9742, dynamic 6072, none 12381 (outside the grid, above max_height or isolated)
-38 objects (dynamic points without an instance: 319):
-    1  vehicle.car                            119 points  speed  0.0 m/s
+38 objects (dynamic points without an instance: 251):
+    1  vehicle.car                            121 points  speed  0.0 m/s
     ...
    10  human.pedestrian.adult                  92 points  speed  1.3 m/s
     ...
@@ -40,54 +39,62 @@ pseg_v6.1_fp16.onnx on CPUExecutionProvider: 47827 points, 4 previous scans
 ```
 
 `segment.py` reads the previous scans `example_sweep_1.pcd` .. `example_sweep_4.pcd` (1 = newest) and their time lags
-from `sweeps.json` next to the scan, and uses the CUDA provider of onnxruntime if it is available, else the CPU. It
-reads PCD files with `DATA ascii` or `binary` and the fields x y z intensity. Options:
+from `sweeps.json` next to the scan, and uses the CUDA provider of onnxruntime if it is available, else the CPU.
+Options:
 
+- `--dataset unknown`: the style, class head and intensity mapping, one of `nuscenes`, `semantickitti`, `waymo`,
+  `pandaset`, `unknown` (see [Styles and datasets](#styles-and-datasets));
 - `--lidar_height 2.11`: the lidar's height above the ground (m);
 - `--no-sweeps`: without previous scans (segmentation stays, velocity is not usable);
 - `--show`: interactive 3D view, `--plot out.png`: the same scene rendered offscreen to a PNG. Both need
-  `pip install open3d` (tested with 0.19.0); the printed object list is their legend;
+  `pip install open3d` (tested with 0.19.0); the printed object list is their legend. `--plot` renders through EGL: it
+  works on a desktop or a machine with an NVIDIA driver, not on a headless machine without one;
 - `--out results.npz`: the per-point results (points, group, inst, native, velocity, class_names);
-- `--cpu`: the CPU even if CUDA is available.
-
-On a 16-core CPU (Python 3.9, onnxruntime 1.19) `segment.py` takes about 4 s for the example including model
-loading, with 1.7 GB of memory. On a GPU a scan takes about 20 ms with TensorRT fp16 and about 0.23 s with
-onnxruntime's CUDA provider (V100). `--plot` renders offscreen through EGL: it works on a desktop or a machine with an
-NVIDIA driver, not on a headless machine without one (Open3D cannot initialise EGL there).
+- `--cpu`: the CPU even if CUDA is available; `--trt`: TensorRT fp16 through onnxruntime's TensorRT provider
+  (onnxruntime-gpu built with TensorRT), with the inputs padded to 65536 / 262144 rows so that one engine is built
+  (the first run builds it, minutes; it is cached in the working directory);
+- `--repeat N`: N more runs on the same inputs, and the median time of the model per scan (`session.run` only, without
+  loading the model or creating the session), with the pre-processing time (reading, filtering, padding) separately.
 
 ## Model
 
-- **Input:** the current scan (x, y, z, raw intensity in the lidar frame) and the 4 previous scans moved into the
-  current lidar frame, with their time lags.
+- **Input:** the current scan (x, y, z, raw intensity in the lidar frame), the 4 previous scans moved into the
+  current lidar frame with their time lags, and the dataset index that selects the style.
 - **Network:** a per-point MLP max-pooled into a 0.2 m bird's-eye-view grid over +-76.8 m (768 x 768 cells, 4 height
   slices), a residual CNN backbone with an FPN neck at 0.4 m, and heads for a BEV object-centre heatmap, per-point
-  group, thing, offset to the object centre and classes, and a BEV velocity map on its own neck.
+  group, thing, offset to the object centre and classes (one head per training dataset), and a BEV velocity map on its
+  own neck. A learned style embedding modulates the encoder, backbone and point head.
 - **Decoding inside the graph:** heatmap peaks are object centres; dynamic thing points shifted by their predicted
   offset join the nearest centre within 2 m. A local ground height is estimated from the ground points, and points more
   than `max_height` above it (canopy) are dropped. Isolated static points within `filter_range` are dropped as noise.
-  Obstacle points without an instance that move faster than 2 m/s next to an instance join it.
-- **Output per point:** group (ground / static / dynamic / none), instance id (per scan, not tracked), nuScenes class,
-  xy velocity of its object.
-- **fp16:** `pseg_v6.1_fp16.onnx` (23 MB) is the deployed model `pseg_v6.1` with the network's weights and computation
-  converted to fp16 by onnxruntime's float16 converter (`keep_io_types`); the in-graph pre- and post-processing stays
-  fp32. On our test set through the deployed node code (onnxruntime, CUDA) it gives PQ 0.857, the same as the deployed
-  TensorRT fp16 engine (the fp32 model: 0.861), and per-object velocity errors of 1.04 / 0.33 m/s for moving / static
-  objects (fp32: 0.98 / 0.34). Against the fp32 model it agrees on 98.3% of the points' groups, 99.6% of their instance
-  membership and 95.7% of their classes. On the CPU the fp16 model computes partly through casts and is not faster
-  than fp32; its advantage is the file size (fp32: 42 MB).
-- **Class names:** `pseg_v6.1_fp16.yaml` and the ONNX metadata key `class_names`.
+  Obstacle points without an instance that move faster than 2 m/s within 1 m of an instance join it, and dynamic points
+  without an instance within 1 m of a vehicle instance join it unless they are classed as a person or two-wheeler
+  (fragments of long vehicles).
+- **Output per point:** group (ground / static / dynamic / none), instance id of dynamic points (per scan, not
+  tracked), class, xy velocity of its object.
+- **fp16:** `pseg_v6.2_fp16.onnx` (16 MB) has the network in fp16: every node of the network module (point MLP,
+  max-pooling scatter into the BEV grid, style embedding and modulation, backbone, FPN necks and heads), converted by
+  onnxruntime's float16 converter with fp32 inputs and outputs (`keep_io_types`). The graph's own pre- and
+  post-processing (intensity mapping, heatmap peaks, instance assignment, local ground height, filters, the fragment and
+  velocity rules) stays fp32. Against the fp32 graph on the full validation splits, PQ drops by 0.019 on nuScenes and
+  by 0.002-0.005 on SemanticKITTI, Waymo and PandaSet, and the official metrics by up to 0.025 (see
+  [Results](#results)). TensorRT's own fp16 mode applied to the fp32 graph lost less on our data (-0.0025 PQ); this
+  repository ships only the fp16 file.
+- **Input size:** `points` and `sweeps` accept any number of rows. A whole 64-beam scan can be passed. Padding rows
+  `(1e4, 0, 0, 0[, 0])` are ignored, and fixed-size padded inputs (65536 / 262144 rows) give TensorRT a single input
+  shape (`segment.py --trt`).
 
-The model was trained with the lab's training code, which is not public.
+The model was trained with the lab's training code, which is not public. The sibling demo
+[lidar_pillar_detector](https://github.com/UT-ADL/lidar_pillar_detector) does the same for the lab's 3D box detector.
 
 **Limitations:**
 
-- The classes come from the nuScenes head; the other datasets' heads are in the network but not exported.
-- The "unknown" style is used for every input; it was chosen on our test set, not tuned for other sensors.
 - Trained on 32-64 beam rotating lidars at 10-20 Hz; other sensors (solid-state, much denser or sparser scans) are
-  outside the training distribution. Points closer than 2.7 m were not seen at deployment.
+  outside the training distribution.
 - Instance ids are per scan; there is no temporal identity (use a tracker).
 - The previous scans must be motion-compensated by the caller; wrong poses give wrong velocities.
 - Long vehicles (buses, trucks with trailers) are sometimes split into two objects at long range.
+- Static objects with instance labels in the datasets (barriers, traffic cones) are static points, not instances.
 
 ## ONNX interface
 
@@ -95,49 +102,62 @@ Inputs:
 
 | name | shape | dtype | meaning |
 |---|---|---|---|
-| `points` | (65536, 4) | float32 | the current scan: x, y, z (m, lidar frame: x forward, y left, z up, origin at the lidar), raw intensity (VLP-32C: 0-255). Unused rows: padding `(1e4, 0, 0, 0)`, a point far outside the grid. Points closer than 2.7 m should be removed (the deployed lidar driver's minimum range). |
-| `sweeps` | (262144, 5) | float32 | the previous 4 scans, see [Multi-sweep input](#multi-sweep-input). Padding `(1e4, 0, 0, 0, 0)` |
-| `max_height` | (1,) | float32 | non-ground points more than this above the local predicted ground get group -1 (deployed 2.5 m) |
+| `points` | (N, 4) | float32 | the current scan, any number of points N: x, y, z (m, lidar frame: x forward, y left, z up, origin at the lidar), raw intensity (VLP-32C: 0-255). Padding rows `(1e4, 0, 0, 0)` (a point far outside the grid) are ignored, e.g. to pad to a fixed size for TensorRT. `segment.py` drops points closer than 2.7 m (the minimum range of our lidar driver). |
+| `sweeps` | (M, 5) | float32 | the previous 4 scans, any number of rows M, see [Multi-sweep input](#multi-sweep-input). Padding `(1e4, 0, 0, 0, 0)`; no history: one padding row |
+| `max_height` | (1,) | float32 | non-ground points more than this above the local predicted ground get group -1 (`segment.py`: 2.5 m) |
 | `lidar_height` | (1,) | float32 | the lidar's height above the ground in m (our car: 2.11) |
-| `filter_range` | (1,) | float32 | within this range (m), static points with fewer than `min_static_points` static points in the surrounding 3 x 3 cells of 0.2 m are dropped as noise (deployed 38 m: beyond it a real obstacle hit by one VLP-32C beam can have fewer returns) |
+| `filter_range` | (1,) | float32 | within this range (m), static points with fewer than `min_static_points` static points in the surrounding 3 x 3 cells of 0.2 m are dropped as noise (`segment.py`: 38 m; beyond it a real obstacle hit by one VLP-32C beam can have fewer returns) |
+| `dataset` | (1,) | int64 | index into the `datasets` metadata: the style embedding, the class head of `native` and the intensity mapping (see [Styles and datasets](#styles-and-datasets)) |
 
-Outputs (one row per row of `points`; padding rows give -1 / 0):
+Outputs (one row per row of `points`, N; padding rows give -1 / 0):
 
 | name | shape | dtype | meaning |
 |---|---|---|---|
-| `group` | (65536,) | int32 | 0 ground, 1 static, 2 dynamic, -1 none (padding, outside the grid, above `max_height`, isolated static point) |
-| `inst` | (65536,) | int32 | instance id 1..256 of dynamic points with an object centre, 0 none; ids are per scan. The deployed node groups dynamic points without an instance by connected 0.5 m cells. |
-| `native` | (65536,) | int32 | index into the `class_names` metadata (nuScenes lidarseg classes) |
-| `velocity` | (65536, 2) | float32 | over-ground xy velocity of the point's object, m/s, lidar frame axes |
+| `group` | (N,) | int32 | 0 ground, 1 static, 2 dynamic, -1 none (padding, outside the grid, above `max_height`, isolated static point) |
+| `inst` | (N,) | int32 | instance id 1..256 of dynamic points with an object centre, 0 none; ids are per scan. Dynamic points without an instance can be grouped by connected 0.5 m cells. |
+| `native` | (N,) | int32 | class index into `class_names[dataset]` (for `unknown`: the nuScenes classes) |
+| `velocity` | (N, 2) | float32 | over-ground xy velocity of the point's object, m/s, lidar frame axes |
 
 Metadata (`metadata_props`):
 
 | key | value | meaning |
 |---|---|---|
+| `datasets` | `["nuscenes", "semantickitti", "waymo", "pandaset", "unknown"]` | the values 0-4 of the `dataset` input |
+| `class_names` | JSON object `{dataset: [names]}` for the four datasets | `native` index -> class name of that dataset's head; `unknown` uses `nuscenes` (30 classes: `animal`, `human.pedestrian.*`, `movable_object.*`, `static_object.bicycle_rack`, `vehicle.*`, `flat.*`, `static.*`) |
+| `intensity` | `{"nuscenes": "quantile:nuscenes", "semantickitti": "quantile:kitti", "waymo": "quantile:waymo", "pandaset": "quantile:pandaset", "unknown": "quantile:av2"}` | the intensity mapping per dataset: raw intensity to [0, 1] by a quantile table of that dataset's lidar (`unknown`: of Argoverse 2's VLP-32C lidars) |
 | `sweeps` | `4` | number of previous scans |
-| `sweep_points` | `262144` | rows of the `sweeps` input |
+| `sweep_points` | `262144` | rows of the `sweeps` input at export; the size to pad to for a fixed input shape (with 65536 rows of `points`) |
+| `dynamic_points` | `true` | `points` and `sweeps` accept any number of rows |
 | `velocity` | `true` | the model has the `velocity` output |
 | `moving_static_speed` | `2.0` | obstacle points without an instance faster than this (m/s) within 1 m of an instance join it |
 | `moving_agree` | `1.5` | ... if their velocity is within this (m/s) of the instance's |
-| `class_names` | JSON list of 30 names | `native` index -> nuScenes class: `animal`, `human.pedestrian.adult`, `.child`, `.construction_worker`, `.personal_mobility`, `.police_officer`, `.stroller`, `.wheelchair`, `movable_object.barrier`, `.debris`, `.pushable_pullable`, `.trafficcone`, `static_object.bicycle_rack`, `vehicle.bicycle`, `vehicle.bus.bendy`, `vehicle.bus.rigid`, `vehicle.car`, `vehicle.construction`, `vehicle.emergency.ambulance`, `.police`, `vehicle.motorcycle`, `vehicle.trailer`, `vehicle.truck`, `flat.driveable_surface`, `flat.other`, `flat.sidewalk`, `flat.terrain`, `static.manmade`, `static.other`, `static.vegetation` |
-| `pseg` | JSON | the network configuration (`cfg`: grid x / y -76.8..76.8 m, z -1..3 m above the ground in 4 slices, voxel 0.2 m, output stride 2, sweeps 4, velocity map on its own neck) and the export constants: `height` 2.11 (lidar height at export), `intensity` `quantile:av2` (raw intensity mapped to [0, 1] with a quantile table of Argoverse 2's VLP-32C lidars), `embed` `unknown`, `head` `nuscenes`, `points` 65536, `ground_cell` 1.0 m, `min_static_points` 4, `dynamic_bias` 2.0 (added to the dynamic group logit), `stuff_fallback` "", `spray_height` 0.0, `spray_range` 30.0 (rain spray rule, off) |
+| `pseg` | JSON | the network configuration (`cfg`: grid x / y -76.8..76.8 m, z -1..3 m above the ground in 4 slices, voxel 0.2 m, output stride 2, sweeps 4, velocity map on its own neck) and the export constants: `height` 2.11 (lidar height at export), `embed` `input`, `head` `nuscenes` (the classes the fragment rule uses), `points` 65536, `ground_cell` 1.0 m, `min_static_points` 4, `dynamic_bias` 2.0 (added to the dynamic group logit), `fragment_dist` 1.0 and `fragment_classes` `into_vehicle` (the fragment rule), `stuff_fallback` "", `spray_height` 0.0, `spray_range` 30.0 (rain spray rule, off) |
 
 ## Styles and datasets
 
 The model was trained on the union of four public lidar datasets. Each has its own class head, and all share the
 ground / static / dynamic, thing, instance and velocity heads. A learned style embedding per dataset adapts the network
-to each sensor and labelling convention, plus an "unknown" style trained on 10% of the frames. The export fixes the
-embedding to "unknown" (the best on our own test set) and the class output to the nuScenes head, so the ONNX model has
-no style or dataset input.
+to each sensor and labelling convention, plus an "unknown" style trained on 10% of the frames for lidars that are none
+of the four. The `dataset` input selects the style, the class head of `native` and the intensity table: 0-3 for the
+four training datasets, 4 for `unknown` (nuScenes classes, the VLP-32C intensity table), the setting for a new lidar.
 
-| dataset | what it contributed | licence (quoted from the terms) | URL |
-|---|---|---|---|
-| nuScenes with nuScenes-lidarseg and Panoptic nuScenes | Velodyne HDL-32E scans, 20 Hz; point classes and instances (the exported class head), sweeps, instance velocities | "Unless specifically labeled otherwise, these Datasets are provided to You under a Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International Public License ("CC BY-NC-SA 4.0"), with the additional terms included herein." (nuScenes Terms of Use, 16 Nov 2021) | https://www.nuscenes.org/terms-of-use |
-| SemanticKITTI (on KITTI odometry) | Velodyne HDL-64E scans, 10 Hz; point classes and instances | SemanticKITTI is based on the KITTI Vision Benchmark and distributed under CC BY-NC-SA 4.0. KITTI: "published under the Creative Commons Attribution-NonCommercial-ShareAlike 3.0 License" | https://www.semantic-kitti.org/dataset.html |
-| Waymo Open Dataset v2 (3D semantic segmentation) | Waymo top-lidar scans; point classes and instances, instance velocities | Waymo Dataset License Agreement for Non-Commercial Use (March 2025): use for "research, teaching, scientific publication and personal experimentation"; "You may publish, in whole or in part, trained model architectures, including weights and biases" with the notice, a copy of the Agreement and attribution (Section 2(c)) | https://waymo.com/open/terms |
-| PandaSet | Hesai Pandar64 scans, 10 Hz; point classes, instances from cuboids | "Unless specifically labeled otherwise, these Datasets are provided to You under a Creative Commons Attribution 4.0 International Public License ("CC BY 4.0"), with the additional terms included in these Dataset Terms." (PandaSet Dataset Terms of Use) | https://pandaset.org |
+| dataset | training frames | validation frames | what it contributed | licence (quoted from the terms) | URL |
+|---|---|---|---|---|---|
+| nuScenes with nuScenes-lidarseg and Panoptic nuScenes | 28130 | 6019 | Velodyne HDL-32E scans, 20 Hz; point classes and instances, sweeps, instance velocities | "Unless specifically labeled otherwise, these Datasets are provided to You under a Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International Public License ("CC BY-NC-SA 4.0"), with the additional terms included herein." (nuScenes Terms of Use, 16 Nov 2021) | https://www.nuscenes.org/terms-of-use |
+| SemanticKITTI (on KITTI odometry) | 19130 (sequences 00-07, 09, 10) | 4071 (sequence 08) | Velodyne HDL-64E scans, 10 Hz; point classes and instances | SemanticKITTI is based on the KITTI Vision Benchmark and distributed under CC BY-NC-SA 4.0. KITTI: "published under the Creative Commons Attribution-NonCommercial-ShareAlike 3.0 License" | https://www.semantic-kitti.org/dataset.html |
+| Waymo Open Dataset v2 (3D semantic segmentation) | 23691 | 5976 | Waymo top-lidar scans; point classes and instances, instance velocities | Waymo Dataset License Agreement for Non-Commercial Use (March 2025): use for "research, teaching, scientific publication and personal experimentation"; "You may publish, in whole or in part, trained model architectures, including weights and biases" with the notice, a copy of the Agreement and attribution (Section 2(c)) | https://waymo.com/open/terms |
+| PandaSet | 4880 | 1200 (held-out sequences) | Hesai Pandar64 scans, 10 Hz; point classes, instances from cuboids | "Unless specifically labeled otherwise, these Datasets are provided to You under a Creative Commons Attribution 4.0 International Public License ("CC BY 4.0"), with the additional terms included in these Dataset Terms." (PandaSet Dataset Terms of Use) | https://pandaset.org |
 
-Argoverse 2, ONCE and Lyft Level 5 were only used to evaluate, not to train. Validation splits were never trained on.
+Frames are the labelled scans: nuScenes keyframes (2 Hz), Waymo segmentation frames (about 2 Hz), SemanticKITTI and
+PandaSet scans (10 Hz). Training draws stratified batches with every dataset in each batch, weighted by the square
+root of its size (SemanticKITTI and PandaSet counted at every 5th frame, as their 10 Hz scans are nearly repeated):
+20 epochs x 2000 steps x 32 frames = 1.28 M samples, then a 4-epoch fine-tune of the whole network with the velocity map added (0.26 M). The
+validation splits were never trained on.
+
+Argoverse 2 (22477 training / 4806 validation frames, the training split not used), ONCE (4961 / 3321) and Lyft Level
+5 (21419 / 1260) were not trained on, only evaluated: they have 3D boxes but no per-point labels, and training on labels
+derived from their boxes (the points inside a box as the object, the rest unsupervised) gave no gain over the four
+segmentation datasets.
 
 ## Multi-sweep input
 
@@ -156,64 +176,74 @@ mounted 2.11 m above the ground on the car's roof).
 
 ## Results
 
-**Public validation splits.** Each dataset evaluated with its own style embedding and class head, 4 previous sweeps,
-300 evenly spaced frames per split, PyTorch fp32 at the final epoch. Obstacles are labelled points up to 2 m above the
-ground within 2.7-75 m.
+All numbers are on the full validation splits, with each segmentation set's own style and class head through the
+`dataset` input and the box-labelled sets with `unknown`. The first value is the shipped file `pseg_v6.2_fp16.onnx`;
+the value in brackets is the same graph in fp32. All runs use onnxruntime 1.20 (CUDA provider) on whole scans.
 
-| Dataset | Validation frames (used / split) | pseg_v6.1: PQ / obstacle recall 50-75 m | pseg_v2 (previous, single scan): PQ / recall 50-75 m |
-|---|---|---|---|
-| nuScenes (Panoptic nuScenes val) | 300 / 6019 | 0.688 / 0.971 | 0.680 / 0.958 |
-| SemanticKITTI (sequence 08) | 300 / 4071 | 0.826 / 0.984 | 0.822 / 0.973 |
-| Waymo Open Dataset v2 (segmentation val) | 300 / 5976 | 0.845 / 0.977 | 0.840 / 0.977 |
-| PandaSet (held-out sequences) | 300 / 1200 | 0.804 / 0.989 | 0.797 / 0.988 |
-| **mean** | | **0.791 / 0.980** | **0.785 / 0.974** |
+**Official metrics** of the four segmentation datasets:
 
-- PQ: class-agnostic panoptic quality of the labelled object instances (matched at IoU > 0.5).
-- Obstacle recall 50-75 m: share of labelled obstacle points at 50-75 m that the model keeps as obstacles. Ground
-  removal and clustering, the pipeline the model replaces, reach 0.016 / 0.462 / 0.498 / 0.570 on the four sets.
-- pseg_v2: the previous deployed model, the same network without previous scans and velocity.
-- Learned velocity, mean error of matched objects (moving / static, m/s): PandaSet 0.85 / 0.24, Waymo 0.76 / 0.19,
-  nuScenes 0.85 / 0.23.
+| Dataset, split, frames | Metric (tool) | fp16 (fp32) |
+|---|---|---|
+| nuScenes, val, 6019 keyframes | Panoptic nuScenes PQ / PQ-dagger / SQ / RQ, 16 classes (nuscenes-devkit 1.2.0, `NuScenesPanopticEval`, min_inst_points 15) | 0.495 / 0.539 / 0.815 / 0.582 (0.508 / 0.550 / 0.818 / 0.596) |
+| | PQ things / stuff (mean of the devkit's per-class PQ over its 10 thing and 6 stuff classes) | 0.395 / 0.660 (0.405 / 0.680) |
+| | lidarseg mIoU, 16 classes (nuscenes-devkit 1.2.0, `LidarSegEval`) | 0.606 (0.631) |
+| SemanticKITTI, sequence 08, 4071 scans | PQ / PQ-dagger / SQ / RQ, 19 classes (semantic-kitti-api a9c749e, `evaluate_panoptic.py`, min instance points 50) | 0.430 / 0.502 / 0.700 / 0.526 (0.439 / 0.507 / 0.704 / 0.535) |
+| | PQ things / stuff | 0.398 / 0.453 (0.401 / 0.466) |
+| | mIoU, 19 classes (`evaluate_semantics.py`) | 0.515 (0.521) |
+| Waymo Open Dataset v2, validation, 5976 frames | mIoU as defined by the Waymo 3D semantic segmentation challenge (23 classes, `TYPE_UNDEFINED` ignored: 22 scored), computed with our implementation; waymo-open-dataset 1.6.4-1.6.7 has no lidar segmentation metric op, and there is no official lidar panoptic metric | 0.573 (0.581) |
+| PandaSet, held-out sequences, 1200 frames | mIoU over its semantic classes present in the split (36), our implementation; PandaSet has no official benchmark tool | 0.307 (0.309) |
 
-**Evaluation-only datasets** (box-labelled, not trained on; unknown embedding, nuScenes head, 300 evenly spaced
-validation frames, PyTorch fp32):
+How the official metrics differ from ours and what was mapped:
 
-| Dataset | Validation frames (used / split) | Previous scans | pseg_v6.1: PQ / recall of box points | pseg_v2: PQ / recall of box points |
-|---|---|---|---|---|
-| Argoverse 2 | 300 / 4806 | 4 (0.1-0.4 s) | 0.838 / 0.998 | 0.818 / 0.998 |
-| ONCE | 300 / 3321 | none (the only cached one is 0.5 s old, outside the trained range) | 0.833 / 0.998 | 0.848 / 0.999 |
-| Lyft Level 5 | 300 / 1260 | 2 (0.2 and 0.4 s) | 0.893 / 0.993 | 0.898 / 0.994 |
+- The official PQ is averaged per class over things and stuff. The graph gives instances to dynamic points only, so
+  static thing classes are never instances: nuScenes barrier PQ 0.030, traffic cone 0.27, against car 0.90 and
+  pedestrian 0.84. SemanticKITTI's things are all dynamic.
+- nuScenes: the head's 30 lidarseg classes are mapped to the devkit's 16 with its own class mapper. The devkit accepts
+  no prediction outside them, so classes the challenge ignores take the nearest challenge class: persons and animals
+  pedestrian, emergency vehicles car, debris, bicycle racks and static.other manmade. Points beyond the +-76.8 m grid,
+  which get no prediction, are set to manmade on nuScenes, to unlabelled (counted as wrong) on SemanticKITTI, and
+  counted as wrong for Waymo and PandaSet. Thing points without an instance get instance 0.
+- The panoptic evaluators compute PQ per class with an IoU > 0.5 match; ours is class-agnostic (below).
 
-These sets have only 3D boxes: an object instance is the set of points inside a labelled box, and the rest of the scan
-has no ground or static labels. PQ therefore depends on how tightly the boxes fit and which classes were labelled, and
-obstacle recall is given for the box points only (the unlabelled rest includes the road).
+**Our metrics** on all seven sets:
 
-**Our test set.** 300 labelled VLP-32C scans from Tartu on the lab's car, never trained on (box-labelled vehicles and
-pedestrians within 50 m), through the deployed node code with TensorRT fp16:
+| Dataset | Validation frames | Style, classes | Previous scans available | Our PQ: 4 previous scans fp16 (fp32) / none, fp16 | Recall, fp16 |
+|---|---|---|---|---|---|
+| nuScenes | 6019 | own | 4 (0.1-0.4 s) | 0.764 (0.783) / 0.718 | 0.840 (50-75 m) |
+| SemanticKITTI | 4071 | own | 4 | 0.839 (0.843) / 0.812 | 0.965 (50-75 m) |
+| Waymo Open Dataset v2 | 5976 | own | 4 | 0.855 (0.857) / 0.834 | 0.966 (50-75 m) |
+| PandaSet | 1200 | own | 4 | 0.857 (0.860) / 0.832 | 0.986 (50-75 m) |
+| Argoverse 2 | 4806 | unknown | 4 | 0.853 / 0.827 | 0.998 (box points) |
+| ONCE | 3321 | unknown | none (its frames are 0.5 s apart, beyond the trained 0.45 s) | 0.798 / 0.798 | 0.996 (box points) |
+| Lyft Level 5 | 1260 | unknown, intensity 0 | 2 (0.2, 0.4 s) | 0.918 / 0.891 | 0.996 (box points) |
 
-| Model / setting | PQ | objects matched / missed | velocity error, moving / static objects (m/s) |
-|---|---|---|---|
-| ground removal + clustering | 0.569 | | |
-| pseg_v2 (previous, deployed until October 2026) | 0.843 | 97.0% / 1.07% | |
-| pseg_v6.1, TensorRT fp16 (deployed) | 0.857 | 97.2% / 0.58% | 1.03 / 0.33 |
-| pseg_v6.1 without previous scans | 0.852 | | not usable (3.5 moving) |
-| `pseg_v6.1_fp16.onnx`, ONNX Runtime CUDA (fp32 model: 0.861) | 0.857 | 97.2% / 0.58% | 1.04 / 0.33 |
+- **Our PQ:** class-agnostic panoptic quality over the labelled instances of dynamic classes (vehicles, pedestrians,
+  cyclists, animals) with at least 10 points within 2.7-75 m. A predicted object is an instance, or a connected group
+  of 0.5 m cells of dynamic points without an instance. A prediction matches an instance at IoU > 0.5, and unmatched
+  predictions count as false positives unless most of their points are labelled stuff, ground or ignored. PQ = SQ x
+  RQ, as in the panoptic literature.
+- **Recall:** the share of labelled obstacle points (up to 2 m above the labelled ground) at 50-75 m that the graph
+  keeps as obstacles (static or dynamic). For the box sets, it is the share of the points inside labelled boxes of dynamic classes
+  kept as obstacles, because the rest of their scans has no labels (it includes the road).
+- **Box sets:** an instance is the set of points inside a labelled box, so PQ also depends on how tightly the boxes
+  fit and which classes were labelled. Lyft's intensity is a constant 100 in its release and is passed as 0 here: with
+  the raw value, the VLP-32C intensity table of `unknown` misreads every point and 41% of the objects are missed (PQ
+  0.509). ONCE's intensity has another scale than the VLP-32C table as well (PQ as shipped).
 
-## Deployment in autoware_mini
+**Inference time** per scan, the model only (`segment.py --repeat 20`: the median of `session.run` without loading the
+model or creating the session), on the example scan (47827 points) with its 4 previous scans:
 
-The model runs on the lab's car in [autoware_mini](https://github.com/UT-ADL/autoware_mini), the lab's ROS 1 autonomy
-stack, as the `lidar_panoptic` detector: a ROS 1 node with ONNX Runtime and the TensorRT execution provider (fp16) at
-the lidar's 10 Hz, about 27 ms per scan on an RTX 2080 Ti. It keeps the previous scans in the map frame, feeds the
-model, and publishes static points to the collision checker and dynamic points with instance, class and velocity to
-the clustering and tracking nodes. The node is under review and not yet in the public repository.
-
-The sibling demo [lidar_pillar_detector](https://github.com/UT-ADL/lidar_pillar_detector) does the same for the lab's
-3D box detector.
+| hardware | runtime | time per scan |
+|---|---|---|
+| NVIDIA RTX 2080 Ti | TensorRT fp16 (onnxruntime TensorRT provider) | **TODO: neuron benchmark** |
+| NVIDIA RTX 2080 Ti | onnxruntime CUDA provider | **TODO: neuron benchmark** |
+| CPU of the RTX 2080 Ti machine | onnxruntime CPU provider | **TODO: neuron benchmark** |
+| AMD EPYC 7763, 16 threads | onnxruntime 1.19 CPU provider | 2.8 s (2.3 s without previous scans) |
 
 ## License
 
 - **Code** (`segment.py`): MIT, see [LICENSE](LICENSE).
-- **Model weights** (`pseg_v6.1_fp16.onnx`, `pseg_v6.1_fp16.yaml`): licensed under
+- **Model weights** (`pseg_v6.2_fp16.onnx`): licensed under
   [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/), copyright 2026 University of Tartu,
   Autonomous Driving Lab, together with the Waymo Dataset License Agreement for Non-Commercial Use below. The weights
   were derived by training on nuScenes, SemanticKITTI, the Waymo Open Dataset and PandaSet (see
