@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
 """Lidar panoptic segmentation of one scan with the ONNX model: per point ground / static / dynamic, object instances,
-nuScenes classes and the over-ground velocity of dynamic objects (from the 4 previous scans).
+classes and the over-ground velocity of dynamic objects (from the 4 previous scans).
 
-usage: python segment.py example.pcd [--lidar_height 2.11] [--no-sweeps] [--show] [--plot out.png] [--out results.npz]
-                         [--cpu]
+usage: python segment.py example.pcd [--dataset unknown] [--lidar_height 2.11] [--no-sweeps] [--show] [--plot out.png]
+                         [--out results.npz] [--cpu] [--repeat N]
 
-The scan is a PCD file (ascii or binary) with the fields x y z intensity in the lidar frame (x forward, y left, z up,
-origin at the lidar) and the sensor's raw intensity. Previous scans are read from <scan>_sweep_1.pcd .. _sweep_4.pcd
-(1 = newest), already transformed into the current lidar frame, with their time lags (s) in sweeps.json
-{"lag": [...]} next to the scan. --show opens an interactive Open3D view, --plot renders the same scene offscreen to a
-PNG (both need `pip install open3d`; the printed object list is the legend). --cpu: CPU even if CUDA is available.
+The scan is a PCD file with the fields x y z intensity in the lidar frame (x forward, y left, z up, origin at the
+lidar) and the sensor's raw intensity. Previous scans are read from <scan>_sweep_1.pcd .. _sweep_4.pcd (1 = newest),
+already transformed into the current lidar frame, with their time lags (s) in sweeps.json {"lag": [...]} next to the
+scan. --dataset selects the style embedding, class head and intensity mapping (unknown: the generic style, nuScenes
+classes, VLP-32C intensity). --show opens an interactive Open3D view, --plot renders the same scene offscreen to a PNG
+(both need `pip install open3d`; the printed object list is the legend). --cpu: CPU even if CUDA is available.
+--repeat N: N more runs of the model on the same inputs and the median time per scan (session.run only, without
+loading the model or creating the session), with the pre-processing time (reading, filtering, padding) separately.
 """
-import argparse, json, os
+import argparse, json, os, time
 import numpy as np
 import onnxruntime as ort
+from pypcd4 import PointCloud
 
-MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pseg_v6.1_fp16.onnx')
+MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pseg_v6.2_fp16.onnx')
 MIN_RANGE = 2.7          # m, minimum range of the lidar driver the model was deployed with
 MAX_HEIGHT = 2.5         # m above the local ground: higher non-ground points (canopy) are not obstacles
 FILTER_RANGE = 38.0      # m, isolated static points (noise) are dropped within this range
@@ -27,35 +31,11 @@ PALETTE = np.array([[0.12, 0.47, 0.71], [1.0, 0.5, 0.05], [0.58, 0.4, 0.74], [0.
 
 
 def read_pcd(path):
-    """x, y, z, intensity (N, 4) float32 of a PCD file (DATA ascii or binary; intensity 0 if the file has none)."""
-    header = {}
-    with open(path, 'rb') as f:
-        while 'DATA' not in header:
-            line = f.readline()
-            if not line:
-                raise ValueError(f'{path}: no DATA line in the PCD header')
-            parts = line.decode('ascii', 'replace').split()
-            if parts and not parts[0].startswith('#'):
-                header[parts[0].upper()] = parts[1:]
-        fields = header['FIELDS']
-        sizes = [int(s) for s in header['SIZE']]
-        types = header['TYPE']
-        counts = [int(c) for c in header.get('COUNT', ['1'] * len(fields))]
-        n = int(header.get('POINTS', [int(header['WIDTH'][0]) * int(header.get('HEIGHT', ['1'])[0])])[0])
-        kind = header['DATA'][0].lower()
-        names = [f'{name}_{i}' if fields.count(name) > 1 else name for i, name in enumerate(fields)]
-        if kind == 'binary':
-            dtype = np.dtype([(name, f'<{t.lower()}{s}', (c,)) for name, s, t, c in zip(names, sizes, types, counts)])
-            rec = np.frombuffer(f.read(n * dtype.itemsize), dtype, count=n)
-            column = lambda name: rec[name][:, 0].astype(np.float32)   # noqa: E731
-        elif kind == 'ascii':
-            table = np.loadtxt(f, dtype=np.float64, ndmin=2)[:n]
-            start = dict(zip(names, np.cumsum([0] + counts)[:-1]))
-            column = lambda name: table[:, start[name]].astype(np.float32)   # noqa: E731
-        else:
-            raise ValueError(f'{path}: DATA {kind} is not supported (use ascii or binary)')
-    zero = np.zeros(n, np.float32)
-    return np.stack([column(k) if k in names else zero for k in ('x', 'y', 'z', 'intensity')], 1)
+    """x, y, z, intensity (N, 4) float32 of a PCD file (intensity 0 if the file has none)."""
+    pc = PointCloud.from_path(path)
+    fields = [f for f in ('x', 'y', 'z', 'intensity') if f in pc.fields]
+    xyz = pc.numpy(fields).astype(np.float32)
+    return xyz if 'intensity' in fields else np.column_stack((xyz, np.zeros(len(xyz), np.float32)))
 
 
 def padded(rows, size, width):
@@ -84,6 +64,18 @@ def session(cpu):
     providers = ['CPUExecutionProvider'] if cpu else \
         [p for p in ('CUDAExecutionProvider', 'CPUExecutionProvider') if p in ort.get_available_providers()]
     return ort.InferenceSession(MODEL, options, providers=providers)
+
+
+def model_inputs(a, shapes, n_sweeps, dataset):
+    """The scan (minimum range applied) and the model's input arrays."""
+    scan = read_pcd(a.scan)
+    scan = scan[np.isfinite(scan).all(1) & (np.hypot(scan[:, 0], scan[:, 1]) >= MIN_RANGE)]
+    inputs = dict(points=padded(scan, shapes['points'][0], 4), max_height=np.array([MAX_HEIGHT], np.float32),
+                  lidar_height=np.array([a.lidar_height], np.float32), filter_range=np.array([FILTER_RANGE], np.float32),
+                  dataset=np.array([dataset], np.int64))
+    sweeps = np.zeros((0, 5), np.float32) if a.no_sweeps else read_sweeps(a.scan, n_sweeps)
+    inputs['sweeps'] = padded(sweeps, shapes['sweeps'][0], 5)
+    return scan, inputs
 
 
 def instances(points, group, inst, native, velocity, names):
@@ -169,39 +161,49 @@ def plot(points, group, inst, objects, lidar_height, path):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('scan')
+    ap.add_argument('--dataset', default='unknown', help='style, class head and intensity mapping (see the metadata)')
     ap.add_argument('--lidar_height', type=float, default=2.11, help='lidar height above the ground (m)')
     ap.add_argument('--no-sweeps', action='store_true', help='without previous scans (no usable velocity)')
     ap.add_argument('--show', action='store_true', help='interactive Open3D view')
     ap.add_argument('--plot', default=None, help='render the scene to this PNG (Open3D offscreen)')
     ap.add_argument('--out', default=None, help='save the per-point results (npz)')
     ap.add_argument('--cpu', action='store_true', help='CPU even if CUDA is available')
+    ap.add_argument('--repeat', type=int, default=0, help='time N more runs of the model (session.run only)')
     a = ap.parse_args()
 
     sess = session(a.cpu)
     meta = sess.get_modelmeta().custom_metadata_map
     shapes = {i.name: i.shape for i in sess.get_inputs()}
-    names = json.loads(meta['class_names'])
-    scan = read_pcd(a.scan)
-    scan = scan[np.isfinite(scan).all(1) & (np.hypot(scan[:, 0], scan[:, 1]) >= MIN_RANGE)]
-    inputs = dict(points=padded(scan, shapes['points'][0], 4), max_height=np.array([MAX_HEIGHT], np.float32),
-                  lidar_height=np.array([a.lidar_height], np.float32), filter_range=np.array([FILTER_RANGE], np.float32))
-    n_sweeps = json.loads(meta.get('sweeps', '0'))
-    if 'sweeps' in shapes:
-        sweeps = np.zeros((0, 5), np.float32) if a.no_sweeps else read_sweeps(a.scan, n_sweeps)
-        inputs['sweeps'] = padded(sweeps, shapes['sweeps'][0], 5)
-    outputs = dict(zip([o.name for o in sess.get_outputs()], sess.run(None, inputs)))
+    datasets = json.loads(meta['datasets'])
+    if a.dataset not in datasets:
+        ap.error(f'--dataset must be one of {datasets}')
+    class_names = json.loads(meta['class_names'])
+    names = class_names[a.dataset if a.dataset in class_names else 'nuscenes']
+    t = time.perf_counter()
+    scan, inputs = model_inputs(a, shapes, json.loads(meta['sweeps']), datasets.index(a.dataset))
+    t_pre = time.perf_counter() - t
+    output_names = [o.name for o in sess.get_outputs()]
+    outputs = dict(zip(output_names, sess.run(None, inputs)))
 
     n = min(len(scan), shapes['points'][0])
     points, group, inst, native = scan[:n], outputs['group'][:n], outputs['inst'][:n], outputs['native'][:n]
     velocity = outputs['velocity'][:n]
-    print(f'{os.path.basename(MODEL)} on {sess.get_providers()[0]}: {n} points, '
-          f'{0 if a.no_sweeps or "sweeps" not in shapes else n_sweeps} previous scans')
+    print(f'{os.path.basename(MODEL)} on {sess.get_providers()[0]}, dataset {a.dataset}: {n} points, '
+          f'{0 if a.no_sweeps else json.loads(meta["sweeps"])} previous scans')
     print('  ' + ', '.join(f'{name} {np.sum(group == g)}' for g, name in enumerate(GROUPS)) +
           f', none {np.sum(group < 0)} (outside the grid, above max_height or isolated)')
     objects = instances(points, group, inst, native, velocity, names)
     print(f'{len(objects)} objects (dynamic points without an instance: {np.sum((group == 2) & (inst == 0))}):')
     for i, cls, count, _, v in objects:
         print(f'  {i:3d}  {cls:36s} {count:5d} points  speed {np.hypot(*v):4.1f} m/s')
+    if a.repeat > 0:
+        times = []
+        for _ in range(a.repeat):
+            t = time.perf_counter()
+            sess.run(None, inputs)
+            times.append(time.perf_counter() - t)
+        print(f'inference {1000 * np.median(times):.1f} ms per scan (median of {a.repeat}, session.run only, '
+              f'{sess.get_providers()[0]}); pre-processing {1000 * t_pre:.1f} ms (reading, filtering, padding)')
     if a.out:
         np.savez_compressed(a.out, points=points, group=group, inst=inst, native=native, velocity=velocity,
                             class_names=np.array(names))
