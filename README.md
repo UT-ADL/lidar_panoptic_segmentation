@@ -235,10 +235,15 @@ model or creating the session), on the example scan (47827 points) with its 4 pr
 
 | hardware | runtime | time per scan |
 |---|---|---|
-| NVIDIA RTX 2080 Ti | TensorRT fp16 (onnxruntime TensorRT provider) | **TODO: neuron benchmark** |
-| NVIDIA RTX 2080 Ti | onnxruntime CUDA provider | **TODO: neuron benchmark** |
-| CPU of the RTX 2080 Ti machine | onnxruntime CPU provider | **TODO: neuron benchmark** |
+| NVIDIA RTX 2080 Ti | TensorRT fp16 (`--trt`, onnxruntime-gpu 1.18.1 TensorRT provider, TensorRT 10.0, CUDA 11.8) | 24 ms (23 ms with the cached engine; the first run builds it in about 5.5 min) |
+| NVIDIA RTX 2080 Ti | onnxruntime-gpu 1.18.1 CUDA provider | 72 ms |
+| 2 x Intel Xeon Silver 4108 1.8 GHz, 32 threads | onnxruntime 1.18.1 CPU provider | 5.5 s |
 | AMD EPYC 7763, 16 threads | onnxruntime 1.19 CPU provider | 2.8 s (2.3 s without previous scans) |
+
+Pre-processing (reading the five PCD files, the range filter, padding) adds 10-14 ms. The fp16 GPU runs give
+slightly different results from the CPU run (37-39 objects against 38 on the example scan); the Quick start output is
+the CPU one. The script prints the provider it runs on: an onnxruntime-gpu build for another CUDA or cuDNN version
+than the machine's fails to load its CUDA provider and falls back to the CPU.
 
 ## License
 
